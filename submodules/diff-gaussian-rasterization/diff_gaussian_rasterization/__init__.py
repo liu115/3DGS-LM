@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -20,7 +20,7 @@ from typing import Dict
 
 class GaussianRasterizationSettings(NamedTuple):
     image_height: int
-    image_width: int 
+    image_width: int
     tanfovx : float
     tanfovy : float
     cx : float
@@ -203,7 +203,7 @@ def rasterize_forward_impl(
 ):
     # Restructure arguments the way that the C++ lib expects them
     args = (
-        raster_settings.bg, 
+        raster_settings.bg,
         means3D,
         colors_precomp,
         opacities,
@@ -296,22 +296,22 @@ class _RasterizeGaussians(torch.autograd.Function):
 
         # Restructure args as C++ method expects them
         args = (raster_settings.bg,
-                means3D, 
-                radii, 
-                colors_precomp, 
-                scales, 
-                rotations, 
-                raster_settings.scale_modifier, 
-                cov3Ds_precomp, 
-                raster_settings.viewmatrix, 
-                raster_settings.projmatrix, 
-                raster_settings.tanfovx, 
+                means3D,
+                radii,
+                colors_precomp,
+                scales,
+                rotations,
+                raster_settings.scale_modifier,
+                cov3Ds_precomp,
+                raster_settings.viewmatrix,
+                raster_settings.projmatrix,
+                raster_settings.tanfovx,
                 raster_settings.tanfovy,
                 raster_settings.cx,
                 raster_settings.cy,
-                grad_color, 
-                sh, 
-                raster_settings.sh_degree, 
+                grad_color,
+                sh,
+                raster_settings.sh_degree,
                 raster_settings.campos,
                 geomBuffer,
                 num_rendered,
@@ -343,37 +343,43 @@ class GaussianRasterizer(nn.Module):
         self.raster_settings = raster_settings
 
     def markVisible(self, positions):
-        # Mark visible points (based on frustum culling for camera) with a boolean 
+        # Mark visible points (based on frustum culling for camera) with a boolean
         with torch.no_grad():
             raster_settings = self.raster_settings
             visible = _C.mark_visible(
                 positions,
                 raster_settings.viewmatrix,
                 raster_settings.projmatrix)
-            
+
         return visible
 
     def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None):
-        
+
         raster_settings = self.raster_settings
 
         if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
             raise Exception('Please provide excatly one of either SHs or precomputed colors!')
-        
+
         if ((scales is None or rotations is None) and cov3D_precomp is None) or ((scales is not None or rotations is not None) and cov3D_precomp is not None):
             raise Exception('Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!')
-        
+
+        device = means3D.device
         if shs is None:
-            shs = torch.Tensor([])
+            # shs = torch.Tensor([])
+            shs = torch.empty(0, device=device)
         if colors_precomp is None:
-            colors_precomp = torch.Tensor([])
+            # colors_precomp = torch.Tensor([])
+            colors_precomp = torch.empty(0, device=device)
 
         if scales is None:
-            scales = torch.Tensor([])
+            # scales = torch.Tensor([])
+            scales = torch.empty(0, device=device)
         if rotations is None:
-            rotations = torch.Tensor([])
+            # rotations = torch.Tensor([])
+            rotations = torch.empty(0, device=device)
         if cov3D_precomp is None:
-            cov3D_precomp = torch.Tensor([])
+            # cov3D_precomp = torch.Tensor([])
+            cov3D_precomp = torch.empty(0, device=device)
 
         # Invoke C++/CUDA rasterization routine
         return rasterize_gaussians(
@@ -382,12 +388,11 @@ class GaussianRasterizer(nn.Module):
             shs,
             colors_precomp,
             opacities,
-            scales, 
+            scales,
             rotations,
             cov3D_precomp,
-            raster_settings, 
+            raster_settings,
         )
-
 
     @staticmethod
     def build_gsgn_data_spec(
@@ -546,7 +551,7 @@ class GaussianRasterizer(nn.Module):
         gsgn_data_spec.weights_ssim = dummy
 
         return gsgn_data_spec
-    
+
     @staticmethod
     def eval_jtf_and_get_sparse_jacobian(
         params: torch.Tensor,

@@ -2,6 +2,7 @@
 #include "gsgn.h"
 #include "rasterizer_impl.h"
 #include "auxiliary.h"
+#include "cuda_error_check.h"
 #include <cooperative_groups.h>
 #include <iostream>
 #include <cub/cub.cuh>
@@ -14,10 +15,118 @@ namespace cg = cooperative_groups;
 #define SPARSE_JT_NUM_THREADS 128
 #define FULL_MASK 0xffffffff
 
+// Helper function to get device properties (cached to avoid repeated queries)
+inline cudaDeviceProp getDeviceProperties() {
+    static cudaDeviceProp prop;
+    static bool initialized = false;
+    if (!initialized) {
+        int device;
+        cudaError_t err = cudaGetDevice(&device);
+        if (err != cudaSuccess) {
+            std::cerr << "ERROR: cudaGetDevice failed: " << cudaGetErrorString(err) << std::endl;
+            throw std::runtime_error("cudaGetDevice failed");
+        }
+        err = cudaGetDeviceProperties(&prop, device);
+        if (err != cudaSuccess) {
+            std::cerr << "ERROR: cudaGetDeviceProperties failed: " << cudaGetErrorString(err) << std::endl;
+            throw std::runtime_error("cudaGetDeviceProperties failed");
+        }
+        initialized = true;
+    }
+    return prop;
+}
+
+// Helper function to set maximum dynamic shared memory for a kernel
+// This allows kernels to use more than the default 48KB limit on modern GPUs
+template<typename KernelFunc>
+inline void setKernelSharedMemoryConfig(KernelFunc kernel, size_t shared_memory_size) {
+    if (shared_memory_size > 49152) {  // More than 48KB
+        static bool info_printed = false;
+        cudaDeviceProp prop = getDeviceProperties();
+
+        // Print info once about the GPU capabilities
+        if (!info_printed) {
+            std::cout << "INFO: GPU " << prop.name << " - Configuring kernels for extended shared memory" << std::endl;
+            std::cout << "      Standard shared memory limit: " << prop.sharedMemPerBlock / 1024 << " KB" << std::endl;
+            std::cout << "      Opt-in shared memory limit: " << prop.sharedMemPerBlockOptin / 1024 << " KB" << std::endl;
+            info_printed = true;
+        }
+
+        // Modern GPUs (A6000, A100, etc.) support up to 164KB or more of shared memory per block
+        // We need to opt-in to use more than the default 48KB
+        size_t max_dynamic_shared = prop.sharedMemPerBlockOptin;
+
+        if (shared_memory_size > max_dynamic_shared) {
+            std::cerr << "ERROR: Requested shared memory (" << shared_memory_size
+                      << " bytes) exceeds device maximum (" << max_dynamic_shared << " bytes)" << std::endl;
+            throw std::runtime_error("Shared memory size exceeds device maximum");
+        }
+
+        cudaError_t err = cudaFuncSetAttribute(
+            kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shared_memory_size
+        );
+        if (err != cudaSuccess) {
+            std::cerr << "ERROR: cudaFuncSetAttribute failed for shared memory size "
+                      << shared_memory_size << " bytes: " << cudaGetErrorString(err) << std::endl;
+            throw std::runtime_error("cudaFuncSetAttribute failed");
+        }
+    }
+}
+
+// Helper function to validate kernel launch parameters
+inline void validateKernelLaunchParams(dim3 grid, dim3 block, size_t shared_memory, const char* kernel_name) {
+    // Check grid dimensions are valid
+    if (grid.x == 0 || grid.y == 0 || grid.z == 0) {
+        std::cerr << "ERROR: Invalid grid dimensions for kernel " << kernel_name
+                  << ": (" << grid.x << ", " << grid.y << ", " << grid.z << ")" << std::endl;
+        throw std::runtime_error("Invalid grid dimensions");
+    }
+
+    // Check block dimensions are valid
+    if (block.x == 0 || block.y == 0 || block.z == 0) {
+        std::cerr << "ERROR: Invalid block dimensions for kernel " << kernel_name
+                  << ": (" << block.x << ", " << block.y << ", " << block.z << ")" << std::endl;
+        throw std::runtime_error("Invalid block dimensions");
+    }
+
+    // Check total threads per block doesn't exceed limit (typically 1024)
+    size_t total_threads = block.x * block.y * block.z;
+    if (total_threads > 1024) {
+        std::cerr << "ERROR: Too many threads per block for kernel " << kernel_name
+                  << ": " << total_threads << " (max 1024)" << std::endl;
+        throw std::runtime_error("Too many threads per block");
+    }
+
+    // Get device properties to check limits
+    cudaDeviceProp prop = getDeviceProperties();
+
+    // Check grid dimensions against device limits
+    if (grid.x > prop.maxGridSize[0] || grid.y > prop.maxGridSize[1] || grid.z > prop.maxGridSize[2]) {
+        std::cerr << "ERROR: Grid dimensions exceed device limits for kernel " << kernel_name << std::endl;
+        std::cerr << "  Grid: (" << grid.x << ", " << grid.y << ", " << grid.z << ")" << std::endl;
+        std::cerr << "  Max:  (" << prop.maxGridSize[0] << ", " << prop.maxGridSize[1]
+                  << ", " << prop.maxGridSize[2] << ")" << std::endl;
+        throw std::runtime_error("Grid dimensions exceed device limits");
+    }
+
+    // Check shared memory size against maximum available
+    size_t max_shared_mem = (shared_memory > 49152) ? prop.sharedMemPerBlockOptin : prop.sharedMemPerBlock;
+    if (shared_memory > max_shared_mem) {
+        std::cerr << "ERROR: Shared memory size exceeds limit for kernel " << kernel_name << std::endl;
+        std::cerr << "  Requested: " << shared_memory << " bytes" << std::endl;
+        std::cerr << "  Available: " << max_shared_mem << " bytes" << std::endl;
+        std::cerr << "  (Standard limit: " << prop.sharedMemPerBlock
+                  << ", Opt-in limit: " << prop.sharedMemPerBlockOptin << ")" << std::endl;
+        throw std::runtime_error("Shared memory size exceeds limit");
+    }
+}
+
 namespace CudaRasterizer {
     namespace GSGN {
 
-        // template magic part 1: 
+        // template magic part 1:
         // - each specialization needs different variables.
         // - we want to avoid allocating variables that are not needed (reduce register count).
         // - use specialized templated structs that only contain the necessary variables
@@ -173,7 +282,7 @@ namespace CudaRasterizer {
             __shared__ int collected_id[NUM_WARPS][32];
             __shared__ char rendered_cache[NUM_WARPS][sizeof(GeometryStateReduced)];
             __shared__ float unactivated_opacity[NUM_WARPS];
-            
+
             using WarpScan = cub::WarpScan<int>;
             __shared__ typename WarpScan::TempStorage temp_storage[NUM_WARPS];
 
@@ -193,7 +302,7 @@ namespace CudaRasterizer {
                     residual[i] = data.residuals[pos];
                 }
             }
-            
+
             const uint32_t global_warp_id = block.group_index().x + block.group_index().y * horizontal_blocks * NUM_WARPS + warp_id * horizontal_blocks;
             uint32_t offset = inside ? data.n_contrib_vol_rend_prefix_sum[img_id][global_warp_id] : 0;
             const uint32_t stride = inside ? data.n_sparse_gaussians[img_id] : 0;
@@ -244,12 +353,12 @@ namespace CudaRasterizer {
 
                     // Skip, if this gaussian is behind the last contributor for this pixel.
                     int is_active = inside && (contributor < last_contributor);
-                    
+
                     // Compute blending values, as before.
                     float2 d = { rendered_data_ptr->means2D[0] - pixf.x, rendered_data_ptr->means2D[1] - pixf.y };
                     float power = -0.5f * (rendered_data_ptr->conic_opacity[0] * d.x * d.x + rendered_data_ptr->conic_opacity[2] * d.y * d.y) - rendered_data_ptr->conic_opacity[1] * d.x * d.y;
                     is_active = is_active && power <= 0.0f;
-                    
+
                     float G = exp(power);
                     float alpha = min(0.99f, rendered_data_ptr->conic_opacity[3] * G);
                     is_active = is_active && alpha >= GSGN_ALPHA_THRESH;
@@ -343,7 +452,7 @@ namespace CudaRasterizer {
                     dalpha_dconic2D.x = -0.5f * gdx * d.x * dalpha_dG;
                     dalpha_dconic2D.y = -0.5f * gdx * d.y * dalpha_dG;
                     dalpha_dconic2D.z = -0.5f * gdy * d.y * dalpha_dG;
-                    
+
                     atom_ptrs[5] = &dL_dconic2D[dL_pos + 0 * dL_offset];
                     atom_vals[5] = dalpha_dconic2D.x * dL_dalpha_residual;
 
@@ -368,7 +477,7 @@ namespace CudaRasterizer {
         }
 
         // Backward version of INVERSE 2D covariance matrix computation
-        // (due to length launched as separate kernel before other 
+        // (due to length launched as separate kernel before other
         // backward steps contained in preprocess)
         template <typename scalar_t, bool write_cache>
         __global__ void __launch_bounds__(256)
@@ -386,7 +495,7 @@ namespace CudaRasterizer {
 
             constexpr uint32_t NUM_ATTRS = sizeof(GaussianCacheComputeCov2D) / sizeof(float);
             __shared__ float cache[256][NUM_ATTRS];
-            
+
             if constexpr(! write_cache) {
                 // collaboratively read in from cache
                 GaussianCache* cache_ptr = reinterpret_cast<GaussianCache*>(per_gaussian_cache) + blockIdx.x * blockDim.x;
@@ -614,7 +723,7 @@ namespace CudaRasterizer {
             GaussianCachePreprocess* cache_ptr) {
 
             // TODO: make deg a template parameter again
-            
+
             // Compute intermediate values, as it is done during forward
             glm::vec3 dir_orig = pos - campos;
             glm::vec3 dir = dir_orig / glm::length(dir_orig);
@@ -638,7 +747,7 @@ namespace CudaRasterizer {
             float y = dir.y;
             float z = dir.z;
 
-            // No tricks here, just high school-level calculus.           
+            // No tricks here, just high school-level calculus.
             #pragma unroll
             for(int ch = 0; ch < GSGN_NUM_CHANNELS; ch++) {
                 int32_t pos_out = get_vector_position<GAUSSIAN_ATTRIBUTE::FEAT_DC>(global_id, ch, 0, data);
@@ -649,7 +758,7 @@ namespace CudaRasterizer {
                 dRGBdsh_d1[0] = -SH_C1 * y;
                 dRGBdsh_d1[1] = SH_C1 * z;
                 dRGBdsh_d1[2] = -SH_C1 * x;
-                                    
+
                 #pragma unroll
                 for(int ch = 0; ch < GSGN_NUM_CHANNELS; ch++) {
                     #pragma unroll
@@ -790,7 +899,7 @@ namespace CudaRasterizer {
             out_vec[pos_out] += dL_dmean.z;
         }
 
-        // Backward pass for the conversion of scale and rotation to a 
+        // Backward pass for the conversion of scale and rotation to a
         // 3D covariance matrix for each Gaussian.
         template <typename scalar_t, bool write_cache>
         __device__ void computeCov3D(
@@ -902,7 +1011,7 @@ namespace CudaRasterizer {
         // for the covariance computation and inversion
         // (those are handled by a previous kernel call)
         template<typename scalar_t, bool write_cache>
-        __global__ void __launch_bounds__(256) 
+        __global__ void __launch_bounds__(256)
         gsgn_preprocessCUDA(
             PackedGSGNDataSpec data,
             const int img_id,
@@ -919,7 +1028,7 @@ namespace CudaRasterizer {
             constexpr uint32_t ATTR_OFFSET = sizeof(GaussianCacheComputeCov2D) / sizeof(float);
             constexpr uint32_t NUM_ATTRS = sizeof(GaussianCachePreprocess) / sizeof(float);
             __shared__ float cache[256][NUM_ATTRS];
-            
+
             if constexpr(! write_cache) {
                 // collaboratively read in dRGBdxyz and R from cache
                 GaussianCache* cache_ptr = reinterpret_cast<GaussianCache*>(per_gaussian_cache) + blockIdx.x * blockDim.x;
@@ -1095,7 +1204,7 @@ namespace CudaRasterizer {
             const uint32_t warp_id = threadIdx.x / 32;
             const int stride = data.n_sparse_gaussians[img_id];
             constexpr uint32_t NUM_WARPS = SPARSE_J_NUM_THREADS / 32;
-            
+
             // load per-image attributes into shared memory -- they are used by all threads in this block
             // first warp reads the camera matrices in parallel, all other warsp read a single value with its first thread
             // hopefully, this will make all these reads in parallel
@@ -1141,7 +1250,7 @@ namespace CudaRasterizer {
                     // first warp reads geom, second warp reads attr, third warp reads cache
                     const int gaussian_idx = warp_id / 4;
                     const int read_idx = warp_id % 4;
-                    
+
                     // this if-statement might make some warps do nothing
                     if(gaussian_idx < num_gaussians) {
                         const int gaussian_global_id = segments_to_gaussian[img_id][segment_idx_block + gaussian_idx];
@@ -1183,7 +1292,7 @@ namespace CudaRasterizer {
                                 uint32_t read_idx = lane_id + k * 32;
                                 if(read_idx >= num_threads_x_vec) break;
                                 x_vec_cache[gaussian_idx * num_threads_x_vec + read_idx] = x_vec[gaussian_global_id * num_threads_x_vec + read_idx];
-                            }                         
+                            }
                         }
                     }
                 } else {
@@ -1457,7 +1566,7 @@ namespace CudaRasterizer {
                 scalar_t jx_sh = SH_C0 * x_vec_feat_dc_cache[ch];
 
                 // write out all features_rest gradients
-                if constexpr(NUM_SH_COEFFS >= 4) {               
+                if constexpr(NUM_SH_COEFFS >= 4) {
                     #pragma unroll
                     for(int i=0; i < 3; i++) {
                         jx_sh += dRGBdsh_cache[i] * x_vec_feat_rest_cache[i * GSGN_NUM_CHANNELS + ch];
@@ -1514,7 +1623,7 @@ namespace CudaRasterizer {
                 // Compute loss gradient w.r.t. matrix M
                 // fused calculation to use R, apply scaling, and directly use dL_dcov instead of matrix form
                 // dSigma_dM = 2 * M
-                
+
                 // Recompute (intermediate) results for the 3D covariance computation.
                 float dL_dMt[9] = {
                     scale.x * (2.0f * gaussian_cache_ptr->R[0] * dL_dcov[0] + gaussian_cache_ptr->R[3] * dL_dcov[1] + gaussian_cache_ptr->R[6] * dL_dcov[2]),
@@ -1642,7 +1751,7 @@ namespace CudaRasterizer {
                     // first half of warps reads geom, second half reads attr
                     const int gaussian_idx = warp_id / 3;
                     const int read_idx = warp_id % 3;
-                    
+
                     // this if-statement might make some warps do nothing
                     if(gaussian_idx < num_gaussians) {
                         const int gaussian_global_id = segments_to_gaussian[img_id][segment_idx_block + gaussian_idx];
@@ -1757,7 +1866,7 @@ namespace CudaRasterizer {
             GeometryStateReduced* rendered_data_ptr = rendered_cache + gaussian_idx;
             GaussianAttributeNoSH* attr_ptr = attr_cache + gaussian_idx;
             GaussianCache* gaussian_cache_ptr = gaussian_cache + gaussian_idx;
-            
+
             // change inputs once instead of multiple times below in the loop
             float3 scale = {
                 data.scale_modifier * exp(attr_ptr->unactivated_scale[0]),
@@ -1867,7 +1976,7 @@ namespace CudaRasterizer {
                 // do warp-reduce over all threads that reference the same gaussian_id
                 scalar_t grad_sum = WarpReduce(temp_storage[warp_id]).HeadSegmentedSum(grad, head_flag);
                 __syncwarp(mask);
-                
+
                 // write out value
                 // is COALESCED because global_id is sequentially increasing and channel/attribute_idx is constant in a block
                 if(head_flag) {
@@ -1978,7 +2087,7 @@ namespace CudaRasterizer {
                 // do warp-reduce over all threads that reference the same gaussian_id
                 grad_sum = WarpReduce(temp_storage[warp_id]).HeadSegmentedSum(grad, head_flag);
                 __syncwarp(mask);
-                
+
                 // write out value
                 // is COALESCED because global_id is sequentially increasing and channel/attribute_idx is constant in a block
                 if(head_flag) {
@@ -1990,7 +2099,7 @@ namespace CudaRasterizer {
                     dRGBdsh_d1[0] = -SH_C1 * y;
                     dRGBdsh_d1[1] = SH_C1 * z;
                     dRGBdsh_d1[2] = -SH_C1 * x;
-                
+
                     // write out all sh gradients
                     #pragma unroll
                     for(int i=0; i < 3; i++) {
@@ -2004,7 +2113,7 @@ namespace CudaRasterizer {
                         // do warp-reduce over all threads that reference the same gaussian_id
                         grad_sum = WarpReduce(temp_storage[warp_id]).HeadSegmentedSum(grad, head_flag);
                         __syncwarp(mask);
-                        
+
                         // write out value
                         // is COALESCED because global_id is sequentially increasing and channel/attribute_idx is constant in a block
                         if(head_flag) {
@@ -2036,7 +2145,7 @@ namespace CudaRasterizer {
                             // do warp-reduce over all threads that reference the same gaussian_id
                             grad_sum = WarpReduce(temp_storage[warp_id]).HeadSegmentedSum(grad, head_flag);
                             __syncwarp(mask);
-                            
+
                             // write out value
                             // is COALESCED because global_id is sequentially increasing and channel/attribute_idx is constant in a block
                             if(head_flag) {
@@ -2067,7 +2176,7 @@ namespace CudaRasterizer {
                                 // do warp-reduce over all threads that reference the same gaussian_id
                                 grad_sum = WarpReduce(temp_storage[warp_id]).HeadSegmentedSum(grad, head_flag);
                                 __syncwarp(mask);
-                                
+
                                 // write out value
                                 // is COALESCED because global_id is sequentially increasing and channel/attribute_idx is constant in a block
                                 if(head_flag) {
@@ -2105,7 +2214,7 @@ namespace CudaRasterizer {
                     // do warp-reduce over all threads that reference the same gaussian_id
                     grad_sum = WarpReduce(temp_storage[warp_id]).HeadSegmentedSum(grad, head_flag);
                     __syncwarp(mask);
-                    
+
                     // write out value
                     // is COALESCED because global_id is sequentially increasing and channel/attribute_idx is constant in a block
                     if(head_flag) {
@@ -2149,7 +2258,7 @@ namespace CudaRasterizer {
                     // do warp-reduce over all threads that reference the same gaussian_id
                     grad_sum = WarpReduce(temp_storage[warp_id]).HeadSegmentedSum(grad, head_flag);
                     __syncwarp(mask);
-                    
+
                     // write out value
                     // is COALESCED because global_id is sequentially increasing and channel/attribute_idx is constant in a block
                     if(head_flag) {
@@ -2190,7 +2299,7 @@ namespace CudaRasterizer {
                     // do warp-reduce over all threads that reference the same gaussian_id
                     grad_sum = WarpReduce(temp_storage[warp_id]).HeadSegmentedSum(grad, head_flag);
                     __syncwarp(mask);
-                    
+
                     // write out value
                     // is COALESCED because global_id is sequentially increasing and channel/attribute_idx is constant in a block
                     if(head_flag) {
@@ -2310,7 +2419,7 @@ namespace CudaRasterizer {
                 gaussian_idx++;
             }
             GeometryStateReduced* rendered_data_ptr = rendered_cache + gaussian_idx;
-            
+
             // determine if we are at the end of a gaussian (assumes index_map is sorted by global_id and ray_id)
             // is FAST because we use the warp intrinsic
             const int32_t global_id = global_id_cache[gaussian_idx];
@@ -2364,7 +2473,7 @@ namespace CudaRasterizer {
             // screen-space viewport corrdinates (-1 to 1)
             const float ddelx_dx = 0.5f * data.W;
             const float ddely_dy = 0.5f * data.H;
-            
+
             // Update gradients w.r.t. 2D mean position of the Gaussian
             scalar_t grad = dL_dG * dG_ddelx * ddelx_dx;
             scalar_t grad_sum = WarpReduce(temp_storage[warp_id]).HeadSegmentedSum(grad, head_flag);
@@ -2473,7 +2582,7 @@ namespace CudaRasterizer {
             for(int i = 0; i < GSGN_NUM_CHANNELS; i++) {
                 data_ptr->clamped[i] = clamped[GSGN_NUM_CHANNELS * idx + i];
             }
-            
+
             // write out radius -- convert to only bool > 0
             data_ptr->radius_gt_zero = radii[idx] > 0;
 
@@ -2553,9 +2662,24 @@ void CudaRasterizer::GSGN::filter_reordered_geometry_buffer(const int num_visibl
 
 // eval_jtf_and_get_sparse_jacobian
 template<typename T> void CudaRasterizer::GSGN::eval_jtf_and_get_sparse_jacobian(PackedGSGNDataSpec& data, T* r_vec, __half** sparse_jacobians, int** index_map, float** per_gaussian_cache) {
+    // Validate input parameters
+    if (data.max_n_visible_gaussians < 0) {
+        std::cerr << "ERROR: Invalid max_n_visible_gaussians: " << data.max_n_visible_gaussians << std::endl;
+        throw std::runtime_error("Invalid max_n_visible_gaussians");
+    }
+    if (r_vec == nullptr || sparse_jacobians == nullptr || index_map == nullptr || per_gaussian_cache == nullptr) {
+        std::cerr << "ERROR: NULL pointer passed to eval_jtf_and_get_sparse_jacobian" << std::endl;
+        throw std::runtime_error("NULL pointer argument");
+    }
+
     // alloc additional memory for the intermediate outputs
     T* helper_memory;
-    cudaMallocManaged((void**) &helper_memory, data.max_n_visible_gaussians * (2 + 3 + GSGN_NUM_CHANNELS + 6) * sizeof(T));
+    size_t alloc_size = data.max_n_visible_gaussians * (2 + 3 + GSGN_NUM_CHANNELS + 6) * sizeof(T);
+    if (alloc_size == 0 || alloc_size > (1ULL << 40)) {  // sanity check: > 1TB is suspicious
+        std::cerr << "ERROR: Suspicious allocation size: " << alloc_size << " bytes" << std::endl;
+        throw std::runtime_error("Invalid allocation size");
+    }
+    CHECK_CUDA_CALL(cudaMallocManaged((void**) &helper_memory, alloc_size));
 
     T* dL_dmeans2D = helper_memory;
     T* dL_dconic2D = dL_dmeans2D + data.max_n_visible_gaussians * 2;
@@ -2570,9 +2694,10 @@ template<typename T> void CudaRasterizer::GSGN::eval_jtf_and_get_sparse_jacobian
         int dL_offset = data.n_visible_gaussians[i];
 
         // reset to zeros (except dL_dcov3D)
-        cudaMemset(helper_memory, 0, data.max_n_visible_gaussians * (2 + 3 + GSGN_NUM_CHANNELS) * sizeof(T));
+        CHECK_CUDA_CALL(cudaMemset(helper_memory, 0, data.max_n_visible_gaussians * (2 + 3 + GSGN_NUM_CHANNELS) * sizeof(T)));
 
         // Propagate gradients to 2D mean, conic and opacity
+        validateKernelLaunchParams(grid_render, block_render, 0, "eval_jtf_sparse_render_bkwd_kernel");
         eval_jtf_sparse_render_bkwd_kernel<T><<<grid_render, block_render>>>(
             data, i, dL_offset, r_vec, dL_dcolors, dL_dmeans2D, dL_dconic2D, sparse_jacobians[i], index_map[i]
         );
@@ -2583,6 +2708,7 @@ template<typename T> void CudaRasterizer::GSGN::eval_jtf_and_get_sparse_jacobian
         // Somewhat long, thus it is its own kernel rather than being part of
         // "preprocess". When done, loss gradient w.r.t. 3D means has been
         // modified and gradient w.r.t. 3D covariance matrix has been computed.
+        validateKernelLaunchParams(grid_rest, block_rest, 0, "gsgn_computeCov2DCUDA");
         gsgn_computeCov2DCUDA<T, true><<<grid_rest, block_rest>>>(
             data, i, dL_offset, dL_dconic2D, r_vec, dL_dcov3D, per_gaussian_cache[i], data.map_cache_to_gaussians[i]
         );
@@ -2590,13 +2716,14 @@ template<typename T> void CudaRasterizer::GSGN::eval_jtf_and_get_sparse_jacobian
         // Propagate gradients for remaining steps: finish 3D mean gradients,
         // propagate color gradients to SH (if desired), propagate 3D covariance
         // matrix gradients to scale and rotation.
+        validateKernelLaunchParams(grid_rest, block_rest, 0, "gsgn_preprocessCUDA");
         gsgn_preprocessCUDA<T, true><<<grid_rest, block_rest>>>(
             data, i, dL_offset, dL_dmeans2D, dL_dcolors, dL_dcov3D, r_vec, per_gaussian_cache[i], data.map_cache_to_gaussians[i]
         );
     }
 
     // free additional memory for the intermediate outputs
-    cudaFree(helper_memory);
+    CHECK_CUDA_CALL(cudaFree(helper_memory));
 }
 template void CudaRasterizer::GSGN::eval_jtf_and_get_sparse_jacobian<float>(PackedGSGNDataSpec& data, float* r_vec, __half** sparse_jacobians, int** index_map, float** per_gaussian_cache);
 template void CudaRasterizer::GSGN::eval_jtf_and_get_sparse_jacobian<double>(PackedGSGNDataSpec& data, double* r_vec, __half** sparse_jacobians, int** index_map, float** per_gaussian_cache);
@@ -2606,27 +2733,41 @@ template<typename T> void CudaRasterizer::GSGN::apply_j(PackedGSGNDataSpec& data
     dim3 grid = dim3((data.max_n_sparse_gaussians + SPARSE_J_NUM_THREADS - 1) / SPARSE_J_NUM_THREADS, data.num_images, 1);
     dim3 block = dim3(SPARSE_J_NUM_THREADS, 1, 1);
 
+    // TODO: Add that if data.P == 0, we just return;
+
     if(data.D == 0) {
         assert(data.M == 1);
         constexpr uint32_t num_attrs_per_gaussian = 3 + 3 + 4 + 1 + 3 * 1;
         constexpr uint32_t bytes_x_vec_per_gaussian = num_attrs_per_gaussian * sizeof(T);
         constexpr uint32_t bytes_per_gaussian = sizeof(GeometryStateReduced) + sizeof(GaussianCache) + bytes_x_vec_per_gaussian + sizeof(GaussianAttributeNoSH);
-        apply_j_resort_x_vec_kernel<T, 1><<<(data.P + 127) / 128, 128>>>(
+        dim3 resort_grid = dim3((data.P + 127) / 128, 1, 1);
+        dim3 resort_block = dim3(128, 1, 1);
+        validateKernelLaunchParams(resort_grid, resort_block, 0, "apply_j_resort_x_vec_kernel<T, 1>");
+        apply_j_resort_x_vec_kernel<T, 1><<<resort_grid, resort_block>>>(
             data, x_vec, x_resorted_vec
         );
+        CHECK_CUDA_ERROR("apply_j_resort_x_vec_kernel<T, 1>");
         uint32_t size_shared_memory = max_gaussians_per_block * bytes_per_gaussian;
+        setKernelSharedMemoryConfig(apply_j_kernel<GSGN_NUM_CHANNELS, T, 1>, size_shared_memory);
+        validateKernelLaunchParams(grid, block, size_shared_memory, "apply_j_kernel<GSGN_NUM_CHANNELS, T, 1>");
         apply_j_kernel<GSGN_NUM_CHANNELS, T, 1><<<grid, block, size_shared_memory>>>(
             data, x_resorted_vec, sparse_jacobians, index_map, per_gaussian_cache, segments, segments_to_gaussians, num_gaussians_in_block, block_offset_in_segments, max_gaussians_per_block, jx_vec
         );
+        CHECK_CUDA_ERROR("apply_j_kernel<GSGN_NUM_CHANNELS, T, 1>");
     } else if(data.D == 1) {
         assert(data.M == 4);
         constexpr uint32_t num_attrs_per_gaussian = 3 + 3 + 4 + 1 + 3 * 4;
         constexpr uint32_t bytes_x_vec_per_gaussian = num_attrs_per_gaussian * sizeof(T);
         constexpr uint32_t bytes_per_gaussian = sizeof(GeometryStateReduced) + sizeof(GaussianCache) + bytes_x_vec_per_gaussian + sizeof(GaussianAttributeNoSH);
-        apply_j_resort_x_vec_kernel<T, 4><<<(data.P + 127) / 128, 128>>>(
+        dim3 resort_grid = dim3((data.P + 127) / 128, 1, 1);
+        dim3 resort_block = dim3(128, 1, 1);
+        validateKernelLaunchParams(resort_grid, resort_block, 0, "apply_j_resort_x_vec_kernel<T, 4>");
+        apply_j_resort_x_vec_kernel<T, 4><<<resort_grid, resort_block>>>(
             data, x_vec, x_resorted_vec
         );
         uint32_t size_shared_memory = max_gaussians_per_block * bytes_per_gaussian;
+        setKernelSharedMemoryConfig(apply_j_kernel<GSGN_NUM_CHANNELS, T, 4>, size_shared_memory);
+        validateKernelLaunchParams(grid, block, size_shared_memory, "apply_j_kernel<GSGN_NUM_CHANNELS, T, 4>");
         apply_j_kernel<GSGN_NUM_CHANNELS, T, 4><<<grid, block, size_shared_memory>>>(
             data, x_resorted_vec, sparse_jacobians, index_map, per_gaussian_cache, segments, segments_to_gaussians, num_gaussians_in_block, block_offset_in_segments, max_gaussians_per_block, jx_vec
         );
@@ -2635,10 +2776,16 @@ template<typename T> void CudaRasterizer::GSGN::apply_j(PackedGSGNDataSpec& data
         constexpr uint32_t num_attrs_per_gaussian = 3 + 3 + 4 + 1 + 3 * 9;
         constexpr uint32_t bytes_x_vec_per_gaussian = num_attrs_per_gaussian * sizeof(T);
         constexpr uint32_t bytes_per_gaussian = sizeof(GeometryStateReduced) + sizeof(GaussianCache) + bytes_x_vec_per_gaussian + sizeof(GaussianAttributeNoSH);
-        apply_j_resort_x_vec_kernel<T, 9><<<(data.P + 127) / 128, 128>>>(
+        // 64 + 164 + 38 *4 (152) + 44 = 424 bytes per gaussian for float
+        dim3 resort_grid = dim3((data.P + 127) / 128, 1, 1);
+        dim3 resort_block = dim3(128, 1, 1);
+        validateKernelLaunchParams(resort_grid, resort_block, 0, "apply_j_resort_x_vec_kernel<T, 9>");
+        apply_j_resort_x_vec_kernel<T, 9><<<resort_grid, resort_block>>>(
             data, x_vec, x_resorted_vec
         );
         uint32_t size_shared_memory = max_gaussians_per_block * bytes_per_gaussian;
+        setKernelSharedMemoryConfig(apply_j_kernel<GSGN_NUM_CHANNELS, T, 9>, size_shared_memory);
+        validateKernelLaunchParams(grid, block, size_shared_memory, "apply_j_kernel<GSGN_NUM_CHANNELS, T, 9>");
         apply_j_kernel<GSGN_NUM_CHANNELS, T, 9><<<grid, block, size_shared_memory>>>(
             data, x_resorted_vec, sparse_jacobians, index_map, per_gaussian_cache, segments, segments_to_gaussians, num_gaussians_in_block, block_offset_in_segments, max_gaussians_per_block, jx_vec
         );
@@ -2647,10 +2794,16 @@ template<typename T> void CudaRasterizer::GSGN::apply_j(PackedGSGNDataSpec& data
         constexpr uint32_t num_attrs_per_gaussian = 3 + 3 + 4 + 1 + 3 * 16;
         constexpr uint32_t bytes_x_vec_per_gaussian = num_attrs_per_gaussian * sizeof(T);
         constexpr uint32_t bytes_per_gaussian = sizeof(GeometryStateReduced) + sizeof(GaussianCache) + bytes_x_vec_per_gaussian + sizeof(GaussianAttributeNoSH);
-        apply_j_resort_x_vec_kernel<T, 16><<<(data.P + 127) / 128, 128>>>(
+        // 64 + 164 + 59 * 4 (152) + 44 = 508 bytes per gaussian for float
+        dim3 resort_grid = dim3((data.P + 127) / 128, 1, 1);
+        dim3 resort_block = dim3(128, 1, 1);
+        validateKernelLaunchParams(resort_grid, resort_block, 0, "apply_j_resort_x_vec_kernel<T, 16>");
+        apply_j_resort_x_vec_kernel<T, 16><<<resort_grid, resort_block>>>(
             data, x_vec, x_resorted_vec
         );
         uint32_t size_shared_memory = max_gaussians_per_block * bytes_per_gaussian;
+        setKernelSharedMemoryConfig(apply_j_kernel<GSGN_NUM_CHANNELS, T, 16>, size_shared_memory);
+        validateKernelLaunchParams(grid, block, size_shared_memory, "apply_j_kernel<GSGN_NUM_CHANNELS, T, 16>");
         apply_j_kernel<GSGN_NUM_CHANNELS, T, 16><<<grid, block, size_shared_memory>>>(
             data, x_resorted_vec, sparse_jacobians, index_map, per_gaussian_cache, segments, segments_to_gaussians, num_gaussians_in_block, block_offset_in_segments, max_gaussians_per_block, jx_vec
         );
@@ -2661,12 +2814,27 @@ template void CudaRasterizer::GSGN::apply_j<double>(PackedGSGNDataSpec& data, do
 
 // apply_jt
 template<typename T> void CudaRasterizer::GSGN::apply_jt(PackedGSGNDataSpec& data, T* g_vec, T* jx_vec, __half** sparse_jacobians, int** index_map, float** per_gaussian_cache, int** segments, int** segments_to_gaussians, int** num_gaussians_in_block, int** block_offset_in_segments, int max_gaussians_per_block, int* max_gaussians_per_block_per_image_ptr) {
+    // Validate input parameters
+    if (data.max_n_visible_gaussians < 0) {
+        std::cerr << "ERROR: Invalid max_n_visible_gaussians: " << data.max_n_visible_gaussians << std::endl;
+        throw std::runtime_error("Invalid max_n_visible_gaussians");
+    }
+    if (g_vec == nullptr || jx_vec == nullptr || sparse_jacobians == nullptr || index_map == nullptr || per_gaussian_cache == nullptr) {
+        std::cerr << "ERROR: NULL pointer passed to apply_jt" << std::endl;
+        throw std::runtime_error("NULL pointer argument");
+    }
+
     constexpr uint32_t bytes_needed = (sizeof(GeometryStateReduced) + sizeof(float) + 2 * sizeof(int32_t));
 
     // alloc additional memory for the intermediate outputs
     // TODO: keep allocated the whole time?
     T* helper_memory;
-    cudaMallocManaged((void**) &helper_memory, data.max_n_visible_gaussians * (2 + 3 + GSGN_NUM_CHANNELS + 6) * sizeof(T));
+    size_t alloc_size = data.max_n_visible_gaussians * (2 + 3 + GSGN_NUM_CHANNELS + 6) * sizeof(T);
+    if (alloc_size == 0 || alloc_size > (1ULL << 40)) {  // sanity check: > 1TB is suspicious
+        std::cerr << "ERROR: Suspicious allocation size: " << alloc_size << " bytes" << std::endl;
+        throw std::runtime_error("Invalid allocation size");
+    }
+    CHECK_CUDA_CALL(cudaMallocManaged((void**) &helper_memory, alloc_size));
 
     T* dL_dmeans2D = helper_memory;
     T* dL_dconic2D = helper_memory + data.max_n_visible_gaussians * 2;
@@ -2677,7 +2845,7 @@ template<typename T> void CudaRasterizer::GSGN::apply_jt(PackedGSGNDataSpec& dat
         int dL_offset = data.n_visible_gaussians[i];
 
         // reset to zeros (except dL_dcov3D)
-        cudaMemset(helper_memory, 0, data.max_n_visible_gaussians * (2 + 3 + GSGN_NUM_CHANNELS) * sizeof(T));
+        CHECK_CUDA_CALL(cudaMemset(helper_memory, 0, data.max_n_visible_gaussians * (2 + 3 + GSGN_NUM_CHANNELS) * sizeof(T)));
 
         // Propagate gradients to 2D mean, conic and opacity
         int stride = data.n_sparse_gaussians[i];
@@ -2685,9 +2853,12 @@ template<typename T> void CudaRasterizer::GSGN::apply_jt(PackedGSGNDataSpec& dat
         dim3 block = dim3(SPARSE_JT_NUM_THREADS, 1, 1);
         int max_gaussians_per_block_per_image = max_gaussians_per_block_per_image_ptr[i];
         uint32_t size_shared_memory = max_gaussians_per_block_per_image * bytes_needed;
+        setKernelSharedMemoryConfig(apply_jt_render_bkwd_kernel<GSGN_NUM_CHANNELS, T, 1>, size_shared_memory);
+        validateKernelLaunchParams(grid, block, size_shared_memory, "apply_jt_render_bkwd_kernel");
         apply_jt_render_bkwd_kernel<GSGN_NUM_CHANNELS, T, 1><<<grid, block, size_shared_memory>>>(
             data, g_vec, sparse_jacobians[i], index_map[i], per_gaussian_cache[i], segments[i], segments_to_gaussians[i], num_gaussians_in_block[i], block_offset_in_segments[i], max_gaussians_per_block_per_image, stride, i, dL_offset, jx_vec, dL_dcolors, dL_dmeans2D, dL_dconic2D
         );
+        CHECK_CUDA_ERROR("apply_jt_render_bkwd_kernel");
 
         // Propagate gradients for the path of 2D conic matrix computation.
         // Somewhat long, thus it is its own kernel rather than being part of
@@ -2695,20 +2866,24 @@ template<typename T> void CudaRasterizer::GSGN::apply_jt(PackedGSGNDataSpec& dat
         // modified and gradient w.r.t. 3D covariance matrix has been computed.
         grid = dim3((dL_offset + 255) / 256, 1, 1);
         block = dim3(256, 1, 1);
+        validateKernelLaunchParams(grid, block, 0, "gsgn_computeCov2DCUDA");
         gsgn_computeCov2DCUDA<T, false><<<grid, block>>>(
             data, i, dL_offset, dL_dconic2D, g_vec, dL_dcov3D, per_gaussian_cache[i], data.map_cache_to_gaussians[i]
         );
+        CHECK_CUDA_ERROR("gsgn_computeCov2DCUDA");
 
         // Propagate gradients for remaining steps: finish 3D mean gradients,
         // propagate color gradients to SH (if desired), propagate 3D covariance
         // matrix gradients to scale and rotation.
+        validateKernelLaunchParams(grid, block, 0, "gsgn_preprocessCUDA");
         gsgn_preprocessCUDA<T, false><<<grid, block>>>(
             data, i, dL_offset, dL_dmeans2D, dL_dcolors, dL_dcov3D, g_vec, per_gaussian_cache[i], data.map_cache_to_gaussians[i]
         );
+        CHECK_CUDA_ERROR("gsgn_preprocessCUDA");
     }
 
     // free additional memory for the intermediate outputs
-    cudaFree(helper_memory);
+    CHECK_CUDA_CALL(cudaFree(helper_memory));
 }
 template void CudaRasterizer::GSGN::apply_jt<float>(PackedGSGNDataSpec& data, float* g_vec, float* jx_vec, __half** sparse_jacobians, int** index_map, float** per_gaussian_cache, int** segments, int** segments_to_gaussians, int** num_gaussians_in_block, int** block_offset_in_segments, int max_gaussians_per_block, int* max_gaussians_per_block_per_image_ptr);
 template void CudaRasterizer::GSGN::apply_jt<double>(PackedGSGNDataSpec& data, double* g_vec, double* jx_vec, __half** sparse_jacobians, int** index_map, float** per_gaussian_cache, int** segments, int** segments_to_gaussians, int** num_gaussians_in_block, int** block_offset_in_segments, int max_gaussians_per_block, int* max_gaussians_per_block_per_image_ptr);
@@ -2721,6 +2896,8 @@ template<typename T> void CudaRasterizer::GSGN::calc_preconditioner(PackedGSGNDa
         assert(data.M == 1);
         constexpr uint32_t bytes_per_gaussian = bytes_needed + sizeof(GaussianAttributeNoSH);
         uint32_t size_shared_memory = max_gaussians_per_block * bytes_per_gaussian;
+        setKernelSharedMemoryConfig(apply_jt_kernel<GSGN_NUM_CHANNELS, T, 1, GSGN_MODE::PRECONDITIONER>, size_shared_memory);
+        validateKernelLaunchParams(grid, block, size_shared_memory, "apply_jt_kernel<PRECONDITIONER, 1>");
         apply_jt_kernel<GSGN_NUM_CHANNELS, T, 1, GSGN_MODE::PRECONDITIONER><<<grid, block, size_shared_memory>>>(
             data, M_vec, sparse_jacobians, index_map, per_gaussian_cache, segments, segments_to_gaussians, num_gaussians_in_block, block_offset_in_segments, max_gaussians_per_block, nullptr
         );
@@ -2728,6 +2905,8 @@ template<typename T> void CudaRasterizer::GSGN::calc_preconditioner(PackedGSGNDa
         assert(data.M == 4);
         constexpr uint32_t bytes_per_gaussian = bytes_needed + sizeof(GaussianAttributeNoSH);
         uint32_t size_shared_memory = max_gaussians_per_block * bytes_per_gaussian;
+        setKernelSharedMemoryConfig(apply_jt_kernel<GSGN_NUM_CHANNELS, T, 4, GSGN_MODE::PRECONDITIONER>, size_shared_memory);
+        validateKernelLaunchParams(grid, block, size_shared_memory, "apply_jt_kernel<PRECONDITIONER, 4>");
         apply_jt_kernel<GSGN_NUM_CHANNELS, T, 4, GSGN_MODE::PRECONDITIONER><<<grid, block, size_shared_memory>>>(
             data, M_vec, sparse_jacobians, index_map, per_gaussian_cache, segments, segments_to_gaussians, num_gaussians_in_block, block_offset_in_segments, max_gaussians_per_block, nullptr
         );
@@ -2735,6 +2914,8 @@ template<typename T> void CudaRasterizer::GSGN::calc_preconditioner(PackedGSGNDa
         assert(data.M == 9);
         constexpr uint32_t bytes_per_gaussian = bytes_needed + sizeof(GaussianAttributeNoSH);
         uint32_t size_shared_memory = max_gaussians_per_block * bytes_per_gaussian;
+        setKernelSharedMemoryConfig(apply_jt_kernel<GSGN_NUM_CHANNELS, T, 9, GSGN_MODE::PRECONDITIONER>, size_shared_memory);
+        validateKernelLaunchParams(grid, block, size_shared_memory, "apply_jt_kernel<PRECONDITIONER, 9>");
         apply_jt_kernel<GSGN_NUM_CHANNELS, T, 9, GSGN_MODE::PRECONDITIONER><<<grid, block, size_shared_memory>>>(
             data, M_vec, sparse_jacobians, index_map, per_gaussian_cache, segments, segments_to_gaussians, num_gaussians_in_block, block_offset_in_segments, max_gaussians_per_block, nullptr
         );
@@ -2742,6 +2923,8 @@ template<typename T> void CudaRasterizer::GSGN::calc_preconditioner(PackedGSGNDa
         assert(data.M == 16);
         constexpr uint32_t bytes_per_gaussian = bytes_needed + sizeof(GaussianAttributeNoSH);
         uint32_t size_shared_memory = max_gaussians_per_block * bytes_per_gaussian;
+        setKernelSharedMemoryConfig(apply_jt_kernel<GSGN_NUM_CHANNELS, T, 16, GSGN_MODE::PRECONDITIONER>, size_shared_memory);
+        validateKernelLaunchParams(grid, block, size_shared_memory, "apply_jt_kernel<PRECONDITIONER, 16>");
         apply_jt_kernel<GSGN_NUM_CHANNELS, T, 16, GSGN_MODE::PRECONDITIONER><<<grid, block, size_shared_memory>>>(
             data, M_vec, sparse_jacobians, index_map, per_gaussian_cache, segments, segments_to_gaussians, num_gaussians_in_block, block_offset_in_segments, max_gaussians_per_block, nullptr
         );
@@ -2751,11 +2934,11 @@ template<typename T> void CudaRasterizer::GSGN::calc_preconditioner(PackedGSGNDa
 template void CudaRasterizer::GSGN::calc_preconditioner<float>(PackedGSGNDataSpec& data, float* M_vec, __half** sparse_jacobians, int** index_map, float** per_gaussian_cache, int** segments, int** segments_to_gaussians, int** num_gaussians_in_block, int** block_offset_in_segments, int max_gaussians_per_block);
 template void CudaRasterizer::GSGN::calc_preconditioner<double>(PackedGSGNDataSpec& data, double* M_vec, __half** sparse_jacobians, int** index_map, float** per_gaussian_cache, int** segments, int** segments_to_gaussians, int** num_gaussians_in_block, int** block_offset_in_segments, int max_gaussians_per_block);
 
-//sort_sparse_jacobians 
+//sort_sparse_jacobians
 template<typename T> void CudaRasterizer::GSGN::sort_sparse_jacobians(PackedGSGNDataSpec& data, T** in_sparse_jacobians, T** out_sparse_jacobians, int64_t** indices) {
     dim3 grid = dim3((data.max_n_sparse_gaussians * sizeof(GradientCache) + 255) / 256, data.num_images, 1);
     dim3 block = dim3(256, 1, 1);
-    
+
     gsgn_sort_sparse_jacobians_kernel<GSGN_NUM_CHANNELS, T><<<grid, block>>>(
         data, in_sparse_jacobians, out_sparse_jacobians, indices
     );

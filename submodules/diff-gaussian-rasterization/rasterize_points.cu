@@ -3,7 +3,7 @@
  * GRAPHDECO research group, https://team.inria.fr/graphdeco
  * All rights reserved.
  *
- * This software is free for non-commercial, research and evaluation use 
+ * This software is free for non-commercial, research and evaluation use
  * under the terms of the LICENSE.md file.
  *
  * For inquiries contact  george.drettakis@inria.fr
@@ -23,11 +23,11 @@
 #include "cuda_rasterizer/config.h"
 #include "cuda_rasterizer/rasterizer.h"
 #include "cuda_rasterizer/gsgn_data_spec.h"
+#include "cuda_rasterizer/cuda_error_check.h"
 #include "rasterize_points.h"
 #include <fstream>
 #include <string>
 #include <functional>
-
 
 std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     auto lambda = [&t](size_t N) {
@@ -49,7 +49,7 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& cov3D_precomp,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
-	const float tan_fovx, 
+	const float tan_fovx,
 	const float tan_fovy,
     const float cx,
     const float cy,
@@ -76,7 +76,7 @@ RasterizeGaussiansCUDA(
     torch::Tensor out_color = torch::full({GSGN_NUM_CHANNELS, H, W}, 0.0, float_opts);
     torch::Tensor radii = torch::full({P}, 0, int_opts);
 
-    torch::Device device(torch::kCUDA);
+    torch::Device device = means3D.device();        // Key fix: ensure tensors are on the correct device when DDP
     torch::TensorOptions options(torch::kByte);
     torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
     torch::Tensor binningBuffer = torch::empty({0}, options.device(device));
@@ -110,13 +110,13 @@ RasterizeGaussiansCUDA(
             W, H,
             means3D.contiguous().data_ptr<float>(),
             sh.contiguous().data_ptr<float>(),
-            colors.contiguous().data_ptr<float>(), 
-            opacity.contiguous().data_ptr<float>(), 
+            colors.contiguous().data_ptr<float>(),
+            opacity.contiguous().data_ptr<float>(),
             scales.contiguous().data_ptr<float>(),
             scale_modifier,
             rotations.contiguous().data_ptr<float>(),
-            cov3D_precomp.contiguous().data_ptr<float>(), 
-            viewmatrix.contiguous().data_ptr<float>(), 
+            cov3D_precomp.contiguous().data_ptr<float>(),
+            viewmatrix.contiguous().data_ptr<float>(),
             projmatrix.contiguous().data_ptr<float>(),
             campos.contiguous().data_ptr<float>(),
             tan_fovx,
@@ -177,7 +177,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const int R,
 	const torch::Tensor& binningBuffer,
 	const torch::Tensor& imageBuffer,
-	const bool debug) 
+	const bool debug)
 {
     const int P = means3D.size(0);
     const int H = dL_dout_color.size(1);
@@ -201,7 +201,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     if(P != 0) {
         CudaRasterizer::Rasterizer::backward(P, degree, M, R,
         background.contiguous().data_ptr<float>(),
-        W, H, 
+        W, H,
         means3D.contiguous().data_ptr<float>(),
         sh.contiguous().data_ptr<float>(),
         colors.contiguous().data_ptr<float>(),
@@ -222,7 +222,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
         dL_dout_color.contiguous().data_ptr<float>(),
         dL_dmeans2D.contiguous().data_ptr<float>(),
-        dL_dconic.contiguous().data_ptr<float>(),  
+        dL_dconic.contiguous().data_ptr<float>(),
         dL_dopacity.contiguous().data_ptr<float>(),
         dL_dcolors.contiguous().data_ptr<float>(),
         dL_dmeans3D.contiguous().data_ptr<float>(),
@@ -240,11 +240,11 @@ torch::Tensor markVisible(
     torch::Tensor& means3D,
     torch::Tensor& viewmatrix,
     torch::Tensor& projmatrix)
-{ 
+{
   const int P = means3D.size(0);
-  
+
   torch::Tensor present = torch::full({P}, false, means3D.options().dtype(at::kBool));
- 
+
   if(P != 0) {
 	CudaRasterizer::Rasterizer::markVisible(P,
 		means3D.contiguous().data_ptr<float>(),
@@ -252,7 +252,7 @@ torch::Tensor markVisible(
 		projmatrix.contiguous().data_ptr<float>(),
 		present.contiguous().data_ptr<bool>());
   }
-  
+
   return present;
 }
 
@@ -302,7 +302,7 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>, std::vector<torch::Tensor>
     }
 
     if(data.P != 0) {
-        if(data.use_double_precision) {       
+        if(data.use_double_precision) {
             CudaRasterizer::Rasterizer::eval_jtf_and_get_sparse_jacobian<double>(
                 data,
                 r_vec.contiguous().data_ptr<double>(),
@@ -346,6 +346,13 @@ torch::Tensor ApplyJTJ(
     CHECK_INPUT(x_vec);
     CHECK_INPUT(x_resorted_vec);
 
+    // Validate input parameters
+    TORCH_CHECK(data.num_images > 0, "num_images must be positive");
+    TORCH_CHECK(data.P >= 0, "P must be non-negative");
+    TORCH_CHECK(sparse_jacobians.size() == data.num_images, "sparse_jacobians size mismatch");
+    TORCH_CHECK(index_map.size() == data.num_images, "index_map size mismatch");
+    TORCH_CHECK(per_gaussian_cache.size() == data.num_images, "per_gaussian_cache size mismatch");
+
     auto options = data.params.options();
     if(data.use_double_precision) {
         options = options.dtype(torch::kFloat64);
@@ -356,20 +363,20 @@ torch::Tensor ApplyJTJ(
     int** index_maps_ptr;
     __half** sparse_jacobians_ptr;
     float** per_gaussian_caches_ptr;
-    cudaMallocManaged((void**) &index_maps_ptr, data.num_images * sizeof(int*));
-    cudaMallocManaged((void**) &sparse_jacobians_ptr, data.num_images * sizeof(__half*));
-    cudaMallocManaged((void**) &per_gaussian_caches_ptr, data.num_images * sizeof(float*));
+    CHECK_CUDA_CALL(cudaMallocManaged((void**) &index_maps_ptr, data.num_images * sizeof(int*)));
+    CHECK_CUDA_CALL(cudaMallocManaged((void**) &sparse_jacobians_ptr, data.num_images * sizeof(__half*)));
+    CHECK_CUDA_CALL(cudaMallocManaged((void**) &per_gaussian_caches_ptr, data.num_images * sizeof(float*)));
 
     int** segments_ptr;
     int** segments_to_gaussians_ptr;
     int** num_gaussians_in_block_ptr;
     int** block_offset_in_segments_ptr;
     int* max_gaussians_per_block_per_image_ptr;
-    cudaMallocManaged((void**) &segments_ptr, data.num_images * sizeof(int*));
-    cudaMallocManaged((void**) &segments_to_gaussians_ptr, data.num_images * sizeof(int*));
-    cudaMallocManaged((void**) &num_gaussians_in_block_ptr, data.num_images * sizeof(int*));
-    cudaMallocManaged((void**) &block_offset_in_segments_ptr, data.num_images * sizeof(int*));
-    cudaMallocManaged((void**) &max_gaussians_per_block_per_image_ptr, data.num_images * sizeof(int));
+    CHECK_CUDA_CALL(cudaMallocManaged((void**) &segments_ptr, data.num_images * sizeof(int*)));
+    CHECK_CUDA_CALL(cudaMallocManaged((void**) &segments_to_gaussians_ptr, data.num_images * sizeof(int*)));
+    CHECK_CUDA_CALL(cudaMallocManaged((void**) &num_gaussians_in_block_ptr, data.num_images * sizeof(int*)));
+    CHECK_CUDA_CALL(cudaMallocManaged((void**) &block_offset_in_segments_ptr, data.num_images * sizeof(int*)));
+    CHECK_CUDA_CALL(cudaMallocManaged((void**) &max_gaussians_per_block_per_image_ptr, data.num_images * sizeof(int)));
     int max_gaussians_per_block = 0;
 
     for(int i=0; i < data.num_images; i++) {
@@ -392,6 +399,9 @@ torch::Tensor ApplyJTJ(
         int max_gaussians_per_block_per_image = num_gaussians_in_block[i].max().item<int>();
         max_gaussians_per_block_per_image_ptr[i] = max_gaussians_per_block_per_image;
         max_gaussians_per_block = max(max_gaussians_per_block, max_gaussians_per_block_per_image);
+
+        TORCH_CHECK(max_gaussians_per_block_per_image > 0, "max_gaussians_per_block_per_image must be greater than 0");
+        TORCH_CHECK(max_gaussians_per_block > 0, "max_gaussians_per_block must be greater than 0");
     }
 
     if(data.P != 0) {
@@ -414,6 +424,7 @@ torch::Tensor ApplyJTJ(
                 max_gaussians_per_block,
                 max_gaussians_per_block_per_image_ptr
             );
+            CHECK_CUDA_ERROR("apply_j<double>");
 
             // if we have weights: correct math requires to multiply the weight in both apply_j and apply_jt kernels
             // however, we can instead just do it in one kernel and multiply jx_vec with weight^2 (see paper)
@@ -448,6 +459,7 @@ torch::Tensor ApplyJTJ(
                 max_gaussians_per_block,
                 max_gaussians_per_block_per_image_ptr
             );
+            CHECK_CUDA_ERROR("apply_jt<double>");
         } else {
             assert(x_vec.dtype() == torch::kFloat32);
             assert(x_resorted_vec.dtype() == torch::kFloat32);
@@ -467,7 +479,7 @@ torch::Tensor ApplyJTJ(
                 max_gaussians_per_block,
                 max_gaussians_per_block_per_image_ptr
             );
-
+            CHECK_CUDA_ERROR("apply_j<float>");
             // if we have weights: correct math requires to multiply the weight in both apply_j and apply_jt kernels
             // however, we can instead just do it in one kernel and multiply jx_vec with weight^2 (see paper)
             // also we can fuse weight and weight_ssim into one
@@ -501,19 +513,19 @@ torch::Tensor ApplyJTJ(
                 max_gaussians_per_block,
                 max_gaussians_per_block_per_image_ptr
             );
+            CHECK_CUDA_ERROR("apply_jt<float>");
         }
     }
 
     data.free_pointer_memory();
-    cudaFree(index_maps_ptr);
-    cudaFree(sparse_jacobians_ptr);
-    cudaFree(per_gaussian_caches_ptr);
-    cudaFree(segments_ptr);
-    cudaFree(segments_to_gaussians_ptr);
-    cudaFree(num_gaussians_in_block_ptr);
-    cudaFree(block_offset_in_segments_ptr);
-    cudaFree(max_gaussians_per_block_per_image_ptr);
-
+    CHECK_CUDA_CALL(cudaFree(index_maps_ptr));
+    CHECK_CUDA_CALL(cudaFree(sparse_jacobians_ptr));
+    CHECK_CUDA_CALL(cudaFree(per_gaussian_caches_ptr));
+    CHECK_CUDA_CALL(cudaFree(segments_ptr));
+    CHECK_CUDA_CALL(cudaFree(segments_to_gaussians_ptr));
+    CHECK_CUDA_CALL(cudaFree(num_gaussians_in_block_ptr));
+    CHECK_CUDA_CALL(cudaFree(block_offset_in_segments_ptr));
+    CHECK_CUDA_CALL(cudaFree(max_gaussians_per_block_per_image_ptr));
     return g_vec;
 }
 
@@ -561,6 +573,8 @@ torch::Tensor CalcPreconditioner(GSGNDataSpec& data, std::vector<torch::Tensor> 
         num_gaussians_in_block_ptr[i] = num_gaussians_in_block[i].data_ptr<int>();
         block_offset_in_segments_ptr[i] = block_offset_in_segments[i].data_ptr<int>();
         max_gaussians_per_block = max(max_gaussians_per_block, num_gaussians_in_block[i].max().item<int>());
+
+        TORCH_CHECK(max_gaussians_per_block > 0, "max_gaussians_per_block must be greater than 0");
     }
 
     if(data.P != 0) {
@@ -755,7 +769,7 @@ std::vector<torch::Tensor> SortSparseJacobians(GSGNDataSpec& data, std::vector<t
                 in_sparse_jacobians_ptr[i] = sparse_jacobians[i].contiguous().data_ptr<double>();
                 out_sparse_jacobians_ptr[i] = sorted_sparse_jacobians[i].contiguous().data_ptr<double>();
             }
-        
+
             CudaRasterizer::Rasterizer::sort_sparse_jacobians<double>(
                 data,
                 in_sparse_jacobians_ptr,
@@ -822,7 +836,7 @@ std::vector<torch::Tensor> SortSparseJacobians(GSGNDataSpec& data, std::vector<t
 std::vector<torch::Tensor> FilterReorderedGeometryBuffer(std::vector<torch::Tensor> geomBuffer, std::vector<torch::Tensor> map_cache_to_gaussians, std::vector<int> num_visible_gaussians) {
     assert(geomBuffer.size() == map_cache_to_gaussians.size());
     assert(geomBuffer.size() == num_visible_gaussians.size());
-    
+
     std::vector<torch::Tensor> filtered_geometry_buffers;
 
     auto options = geomBuffer[0].options();
