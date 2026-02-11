@@ -28,6 +28,7 @@ setup(
                 "rasterize_points.cu",
                 "ext.cpp"
             ],
+            include_dirs=[os.path.join(os.path.dirname(os.path.abspath(__file__)), "third_party/glm/")],
             # "--use_fast_math"
             extra_compile_args={"nvcc": ["-I" + os.path.join(os.path.dirname(os.path.abspath(__file__)), "third_party/glm/"), "--generate-line-info", "-lineinfo", "--use_fast_math"]})
         ],
